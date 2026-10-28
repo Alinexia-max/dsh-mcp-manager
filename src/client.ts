@@ -90,6 +90,29 @@ function iconRefresh(): React.ReactElement {
   );
 }
 
+/** 面板标题左侧的图标：两层机箱 + 指示灯，呼应“MCP 服务器”而非宿主的齿轮。 */
+function iconServers(): React.ReactElement {
+  return h(
+    "svg",
+    {
+      viewBox: "0 0 24 24",
+      width: 20,
+      height: 20,
+      fill: "none",
+      stroke: "currentColor",
+      strokeWidth: 1.6,
+      strokeLinecap: "round",
+      strokeLinejoin: "round",
+      "aria-hidden": "true",
+      focusable: "false",
+    },
+    h("rect", { x: 3, y: 4, width: 18, height: 6, rx: 2 }),
+    h("rect", { x: 3, y: 14, width: 18, height: 6, rx: 2 }),
+    h("path", { d: "M7 7h.01" }),
+    h("path", { d: "M7 17h.01" }),
+  );
+}
+
 const DICT: Record<string, Record<string, string>> = {
   zh: {
     title: "MCP 服务器",
@@ -941,6 +964,7 @@ function Section(props: SectionProps): React.ReactElement {
           h(
             "div",
             { className: "dsmm-title-row" },
+            h("span", { className: "dsmm-title-icon", "aria-hidden": "true" }, iconServers()),
             h("h2", { className: "dsmm-title" }, t("title")),
             h("span", { className: "dsmm-version" }, `v${__DSMM_VERSION__}`),
             h(
@@ -1095,6 +1119,7 @@ const CSS = `
 .dsmm-header{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;flex-wrap:wrap}
 .dsmm-heading{display:flex;flex-direction:column;gap:0;min-width:0}
 .dsmm-title-row{display:flex;align-items:center;gap:8px 12px;min-width:0;flex-wrap:wrap}
+.dsmm-title-icon{display:flex;align-items:center;justify-content:center;flex:none;width:32px;height:32px;border-radius:var(--dsw-radius-md,10px);color:var(--dsw-alias-brand-primary,#4f8cff);background:var(--dsw-alias-bg-layer-1,#1c1c1c);border:0.5px solid var(--dsw-alias-border-l1,#2f2f2f)}
 .dsmm-links{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-left:4px}
 .dsmm-links svg{flex:none}
 .dsmm-title{margin:0;font-size:24px;line-height:32px;font-weight:600;letter-spacing:-.4px;white-space:nowrap;color:var(--dsw-alias-label-primary,#eeeeee)}
