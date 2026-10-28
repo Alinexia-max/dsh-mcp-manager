@@ -85,6 +85,15 @@ export interface SectionProps {
   t?: Translate;
 }
 
+/** Host 端 `/update` 的应答：远端最新版本与它的来源。 */
+export interface UpdateInfo {
+  latestVersion: string | null;
+  tagName: string | null;
+  source: "release" | "package" | "none";
+  url: string;
+  publishedAt: string | null;
+}
+
 export interface ClientContext {
   effect: (effect: () => (() => void) | void, label?: string) => unknown;
   locale: {

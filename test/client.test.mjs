@@ -165,6 +165,14 @@ eq(
   "phase filter keeps only that phase",
 );
 
+// 检查更新只在本地比版本号，比较规则要能处理 v 前缀、多位段与预发布。
+eq(bundle.compareVersions("1.0.1", "1.0.0"), 1, "patch bump is newer");
+eq(bundle.compareVersions("1.0.0", "1.0.1"), -1, "older patch is detected");
+eq(bundle.compareVersions("v1.0.0", "1.0.0"), 0, "v prefix is ignored");
+eq(bundle.compareVersions("1.10.0", "1.9.9"), 1, "numeric segments compare numerically");
+eq(bundle.compareVersions("1.0.0", "1.0.0-rc.1"), 1, "release outranks its prerelease");
+eq(bundle.compareVersions("2.0", "2.0.0"), 0, "missing segments count as zero");
+
 const effects = [];
 const registered = [];
 const localeRegistrations = [];

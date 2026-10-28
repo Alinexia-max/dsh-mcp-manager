@@ -155,6 +155,61 @@ eq(state.payload?.ok, true, "state response is a success envelope");
 ok(String(state.payload?.data?.storePath).endsWith("servers.json"), "state exposes the config path");
 eq(state.headers["cache-control"], "no-store", "API responses are not cacheable");
 
+// 检查更新：Host 去读 GitHub，这里替掉全局 fetch 验证来源优先级与缓存。
+const realFetch = globalThis.fetch;
+let updateCalls = 0;
+function mockGithub(handler) {
+  globalThis.fetch = async (url, init) => {
+    updateCalls += 1;
+    return handler(String(url), init);
+  };
+}
+
+mockGithub((url) =>
+  url.includes("/releases/latest")
+    ? new Response(
+        JSON.stringify({
+          tag_name: "v1.3.0",
+          html_url: "https://github.com/Alinexia-max/dsh-mcp-manager/releases/tag/v1.3.0",
+          published_at: "2026-10-01T00:00:00Z",
+        }),
+        { status: 200 },
+      )
+    : new Response("not found", { status: 404 }),
+);
+const updateRelease = await call("GET", "/api/dsh-mcp-manager/update?refresh=1");
+eq(updateRelease.status, 200, "update route answers 200");
+eq(updateRelease.payload?.data?.latestVersion, "1.3.0", "release tag is normalized to a bare version");
+eq(updateRelease.payload?.data?.tagName, "v1.3.0", "tag name is kept verbatim");
+eq(updateRelease.payload?.data?.source, "release", "a release wins over the manifest fallback");
+
+// 仓库还没发 release 时回退到 main 分支的 package.json（contents API 的 base64 形态）。
+mockGithub((url) =>
+  url.includes("/contents/package.json")
+    ? new Response(
+        JSON.stringify({ content: Buffer.from(JSON.stringify({ version: "1.4.0" }), "utf8").toString("base64") }),
+        { status: 200 },
+      )
+    : new Response("not found", { status: 404 }),
+);
+const updateManifest = await call("GET", "/api/dsh-mcp-manager/update?refresh=1");
+eq(updateManifest.payload?.data?.latestVersion, "1.4.0", "manifest fallback supplies the version");
+eq(updateManifest.payload?.data?.source, "package", "fallback source is reported");
+
+// 不带 refresh 时命中缓存，不会再去打 GitHub。
+const callsBeforeCache = updateCalls;
+const updateCached = await call("GET", "/api/dsh-mcp-manager/update");
+eq(updateCached.payload?.data?.latestVersion, "1.4.0", "cached check returns the previous answer");
+eq(updateCalls, callsBeforeCache, "cached check skips the network");
+
+// 两个来源都拿不到时返回 none，界面据此提示网络问题。
+mockGithub(() => new Response("boom", { status: 500 }));
+await call("GET", "/api/dsh-mcp-manager/update?refresh=1");
+const updateDown = await call("GET", "/api/dsh-mcp-manager/update?refresh=1");
+eq(updateDown.payload?.data?.source, "none", "unreachable sources degrade to none");
+eq(updateDown.payload?.data?.latestVersion, null, "unreachable sources carry no version");
+globalThis.fetch = realFetch;
+
 const groups = state.payload?.data?.groups ?? [];
 eq(groups.length, 2, "state groups servers by source");
 eq(groups[0]?.id, "dsh", "the first group is the DSH store");

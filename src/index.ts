@@ -14,6 +14,28 @@ const API_PREFIX = "/api/dsh-mcp-manager";
 const CLIENT_MARKER_HEADER = "x-dsh-mcp-manager";
 const MAX_BODY_BYTES = 64 * 1024;
 
+/** 插件仓库：检查更新只读它的 release 与 package.json。 */
+const REPO_SLUG = "Alinexia-max/dsh-mcp-manager";
+const REPO_URL = `https://github.com/${REPO_SLUG}`;
+/** 一次检查的总预算；各来源共用，避免整串回退把界面卡太久。 */
+const UPDATE_DEADLINE_MS = 12000;
+const UPDATE_MIN_TIMEOUT_MS = 1500;
+/** 同一进程内 5 分钟内复用上次结果，避免连点按钮刷爆 GitHub 匿名配额。 */
+const UPDATE_CACHE_MS = 5 * 60 * 1000;
+
+export interface UpdateInfo {
+  /** 远端最新版本号（已去掉 v 前缀）；拿不到时为 null。 */
+  latestVersion: string | null;
+  /** release 的 tag 原文，回退到 package.json 时为 null。 */
+  tagName: string | null;
+  /** 版本来源：GitHub release、仓库 package.json，或两者都拿不到。 */
+  source: "release" | "package" | "none";
+  /** 有新版本时供界面跳转的地址。 */
+  url: string;
+  /** release 发布时间，回退来源为 null。 */
+  publishedAt: string | null;
+}
+
 export interface PluginConfig {
   /** false 时不自动重连已启用的服务器（面板与路由仍然可用）。 */
   autostart?: boolean;
@@ -216,6 +238,89 @@ function trustedHostsOf(ctx: HostContext): string[] {
   return [];
 }
 
+/** 读一个 JSON 端点：超时、非 2xx、解析失败都当成“没拿到”，交给调用方降级。 */
+async function readJson(url: string, timeoutMs: number): Promise<Record<string, unknown> | null> {
+  try {
+    const response = await fetch(url, {
+      headers: { accept: "application/vnd.github+json", "user-agent": "dsh-mcp-manager" },
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    if (!response.ok) return null;
+    const payload: unknown = await response.json();
+    return payload !== null && typeof payload === "object" ? (payload as Record<string, unknown>) : null;
+  } catch {
+    return null;
+  }
+}
+
+/** contents API 把文件内容包在 base64 里。 */
+function decodeContents(value: unknown): Record<string, unknown> | null {
+  if (typeof value !== "string") return null;
+  try {
+    const parsed: unknown = JSON.parse(Buffer.from(value, "base64").toString("utf8"));
+    return parsed !== null && typeof parsed === "object" ? (parsed as Record<string, unknown>) : null;
+  } catch {
+    return null;
+  }
+}
+
+/** 只接受 `1.2.3` / `v1.2.3` / `1.2.3-rc.1` 这类版本串，避免把任意 tag 当成版本。 */
+function normalizeVersion(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim().replace(/^v/i, "");
+  return /^\d+\.\d+\.\d+(?:[-+][0-9a-z.-]+)?$/i.test(trimmed) ? trimmed : null;
+}
+
+/** 按可达性排序版本来源：release → contents API → jsDelivr；共用一条总预算兜住时延。 */
+async function resolveLatestVersion(): Promise<UpdateInfo> {
+  const deadline = Date.now() + UPDATE_DEADLINE_MS;
+  const budget = () => Math.max(UPDATE_MIN_TIMEOUT_MS, deadline - Date.now());
+
+  const release = await readJson(`https://api.github.com/repos/${REPO_SLUG}/releases/latest`, budget());
+  if (release !== null) {
+    const tagName = typeof release.tag_name === "string" ? release.tag_name : null;
+    const version = normalizeVersion(tagName);
+    if (version !== null) {
+      return {
+        latestVersion: version,
+        tagName,
+        source: "release",
+        url: typeof release.html_url === "string" ? release.html_url : `${REPO_URL}/releases`,
+        publishedAt: typeof release.published_at === "string" ? release.published_at : null,
+      };
+    }
+  }
+
+  // 仓库还没发 release 时，main 分支的 package.json 就是“最新版本”的事实来源。
+  // raw.githubusercontent.com 在部分网络下不可达，所以先走同一域名下的 contents API。
+  const manifests = [
+    `https://api.github.com/repos/${REPO_SLUG}/contents/package.json?ref=main`,
+    `https://cdn.jsdelivr.net/gh/${REPO_SLUG}@main/package.json`,
+  ];
+  for (const url of manifests) {
+    const payload = await readJson(url, budget());
+    if (payload === null) continue;
+    const manifest = "content" in payload ? decodeContents(payload.content) : payload;
+    if (manifest === null) continue;
+    const version = normalizeVersion(manifest.version);
+    if (version !== null) {
+      return { latestVersion: version, tagName: null, source: "package", url: REPO_URL, publishedAt: null };
+    }
+  }
+
+  return { latestVersion: null, tagName: null, source: "none", url: REPO_URL, publishedAt: null };
+}
+
+let updateCache: { at: number; value: UpdateInfo } | null = null;
+
+/** 默认走 5 分钟缓存；用户主动点“检查更新”时带 force 绕过缓存。 */
+async function checkForUpdate(force = false): Promise<UpdateInfo> {
+  if (!force && updateCache !== null && Date.now() - updateCache.at < UPDATE_CACHE_MS) return updateCache.value;
+  const value = await resolveLatestVersion();
+  updateCache = { at: Date.now(), value };
+  return value;
+}
+
 function methodNotAllowed(res: ServerResponse, method: string | undefined): void {
   json(res, 405, {
     ok: false,
@@ -278,6 +383,10 @@ function apply(ctx: HostContext, config?: PluginConfig): void {
             if (req.method === "GET" || req.method === "HEAD") {
               const headOnly = req.method === "HEAD";
               if (segments.length === 0) return run(res, () => supervisor.state(), headOnly);
+              if (segments.length === 1 && segments[0] === "update") {
+                const force = url.searchParams.get("refresh") === "1";
+                return run(res, () => checkForUpdate(force), headOnly);
+              }
               if (segments[0] !== "servers") {
                 notFound(res, path);
                 return;

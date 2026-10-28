@@ -14,6 +14,7 @@ import type {
   ToolView,
   Translate,
   Transport,
+  UpdateInfo,
 } from "./client-types.js";
 
 /**
@@ -29,7 +30,33 @@ const h = React.createElement;
 const NS = "mcp-manager";
 const API_ROOT = "/api/dsh-mcp-manager";
 const MUTATION_HEADERS = { "content-type": "application/json", "x-dsh-mcp-manager": "1" };
-const GITHUB_URL = "https://github.com/Alinexia-max/plugin";
+const GITHUB_URL = "https://github.com/Alinexia-max/dsh-mcp-manager";
+const ISSUES_URL = `${GITHUB_URL}/issues`;
+
+/**
+ * 语义化版本比较：返回 1 表示 a 比 b 新，0 相同，-1 更旧。
+ * 只比较数字段与前缀为 `-` 的预发布标记（正式版高于同号预发布），够用且不引依赖。
+ */
+function compareVersions(a: string, b: string): number {
+  const parse = (value: string) => {
+    const [core = "", prerelease = ""] = value.trim().replace(/^v/i, "").split("-", 2);
+    return {
+      numbers: core.split(".").map((part) => Number.parseInt(part, 10) || 0),
+      prerelease,
+    };
+  };
+  const left = parse(a);
+  const right = parse(b);
+  const length = Math.max(left.numbers.length, right.numbers.length);
+  for (let index = 0; index < length; index += 1) {
+    const diff = (left.numbers[index] ?? 0) - (right.numbers[index] ?? 0);
+    if (diff !== 0) return diff > 0 ? 1 : -1;
+  }
+  if (left.prerelease === right.prerelease) return 0;
+  if (left.prerelease === "") return 1;
+  if (right.prerelease === "") return -1;
+  return left.prerelease > right.prerelease ? 1 : -1;
+}
 
 /** 标题行右侧三个链接按钮的图标（GitHub / 问题反馈 / 检查更新）。 */
 function iconGitHub(): React.ReactElement {
@@ -127,6 +154,12 @@ const DICT: Record<string, Record<string, string>> = {
     "link.github": "GitHub",
     "link.feedback": "问题反馈",
     "link.update": "检查更新",
+    "update.checking": "正在检查更新…",
+    "update.latest": "已是最新版本 v{version}",
+    "update.available": "发现新版本 v{version}",
+    "update.open": "查看",
+    "update.offline": "连不上 GitHub，稍后再试",
+    "update.failed": "检查更新失败：{reason}",
     "toolbar.source": "来源",
     "toolbar.sourceAll": "全部来源",
     "toolbar.phase": "状态",
@@ -200,6 +233,12 @@ const DICT: Record<string, Record<string, string>> = {
     "link.github": "GitHub",
     "link.feedback": "Feedback",
     "link.update": "Check updates",
+    "update.checking": "Checking for updates…",
+    "update.latest": "Up to date · v{version}",
+    "update.available": "New version v{version} available",
+    "update.open": "View",
+    "update.offline": "Cannot reach GitHub, try again later",
+    "update.failed": "Update check failed: {reason}",
     "toolbar.source": "Source",
     "toolbar.sourceAll": "All sources",
     "toolbar.phase": "Status",
@@ -792,6 +831,13 @@ function ToolsDialog(props: {
   });
 }
 
+/** 检查更新在标题区下方给出的一行反馈。 */
+interface UpdateNote {
+  tone: "busy" | "ok" | "new" | "warn";
+  text: string;
+  url?: string;
+}
+
 function Section(props: SectionProps): React.ReactElement {
   const t: Translate = typeof props?.t === "function" ? props.t : fallbackTranslate;
   const [state, setState] = React.useState<ManagerState | null>(null);
@@ -804,6 +850,7 @@ function Section(props: SectionProps): React.ReactElement {
   const [sourceFilter, setSourceFilter] = React.useState<SourceId | "all">("all");
   const [phaseFilter, setPhaseFilter] = React.useState<Phase | "all">("all");
   const [collapsed, setCollapsed] = React.useState<Record<string, boolean>>({});
+  const [update, setUpdate] = React.useState<UpdateNote | null>(null);
   const alive = React.useRef(true);
 
   React.useEffect(() => {
@@ -856,6 +903,31 @@ function Section(props: SectionProps): React.ReactElement {
       })
       .then(() => {
         if (alive.current) setBusy(false);
+      });
+  }
+
+  function checkUpdate(): void {
+    if (update !== null && update.tone === "busy") return;
+    setUpdate({ tone: "busy", text: t("update.checking") });
+    request<UpdateInfo>("/update?refresh=1")
+      .then((info) => {
+        if (!alive.current) return;
+        if (info.source === "none" || info.latestVersion === null) {
+          setUpdate({ tone: "warn", text: t("update.offline") });
+          return;
+        }
+        if (compareVersions(info.latestVersion, __DSMM_VERSION__) <= 0) {
+          setUpdate({ tone: "ok", text: format(t("update.latest"), { version: __DSMM_VERSION__ }) });
+          return;
+        }
+        setUpdate({
+          tone: "new",
+          text: format(t("update.available"), { version: info.latestVersion }),
+          url: info.url,
+        });
+      })
+      .catch((caught: unknown) => {
+        if (alive.current) setUpdate({ tone: "warn", text: format(t("update.failed"), { reason: messageOf(caught) }) });
       });
   }
 
@@ -993,6 +1065,7 @@ function Section(props: SectionProps): React.ReactElement {
                   size: "sm",
                   icon: iconExternal(),
                   "aria-label": t("link.feedback"),
+                  onClick: () => window.open(ISSUES_URL, "_blank", "noreferrer"),
                 },
                 t("link.feedback"),
               ),
@@ -1003,12 +1076,28 @@ function Section(props: SectionProps): React.ReactElement {
                   size: "sm",
                   icon: iconRefresh(),
                   "aria-label": t("link.update"),
+                  disabled: update !== null && update.tone === "busy",
+                  onClick: checkUpdate,
                 },
                 t("link.update"),
               ),
             ),
           ),
           h("p", { className: "dsmm-desc" }, t("desc")),
+          update === null
+            ? null
+            : h(
+                "p",
+                { className: "dsmm-update", "data-tone": update.tone, role: "status" },
+                update.text,
+                update.url === undefined
+                  ? null
+                  : h(
+                      "a",
+                      { className: "dsmm-update-link", href: update.url, target: "_blank", rel: "noreferrer" },
+                      t("update.open"),
+                    ),
+              ),
         ),
         h(
           "div",
@@ -1130,6 +1219,10 @@ const CSS = `
 .dsmm-title{margin:0;font-size:24px;line-height:32px;font-weight:600;letter-spacing:-.4px;white-space:nowrap;color:var(--dsw-alias-label-primary,#eeeeee)}
 .dsmm-version{margin-left:8px;font-size:12px;font-weight:500;line-height:18px;letter-spacing:0;white-space:nowrap;vertical-align:baseline;color:var(--dsw-alias-label-tertiary,#a0a0a0)}
 .dsmm-desc{margin:12px 0 0;font-size:14px;line-height:22px;color:var(--dsw-alias-label-tertiary,#a0a0a0)}
+.dsmm-update{margin:8px 0 0;display:flex;align-items:center;gap:8px;font-size:12px;line-height:18px;color:var(--dsw-alias-label-tertiary,#a0a0a0)}
+.dsmm-update[data-tone="new"]{color:var(--dsw-alias-brand-primary,#4f8cff)}
+.dsmm-update[data-tone="warn"]{color:var(--dsw-alias-state-error-primary,#e5534b)}
+.dsmm-update-link{color:inherit;text-decoration:underline;text-underline-offset:2px}
 .dsmm-header-actions{display:flex;gap:8px;flex-wrap:wrap}
 .dsmm-toolbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 .dsmm-select{height:32px;padding:0 8px;box-sizing:border-box;font-family:inherit;font-size:12px;color:var(--dsw-alias-label-primary,#e6e6e6);background:var(--dsw-alias-bg-layer-1,#1c1c1c);border:0.5px solid var(--dsw-alias-border-l2,#3a3a3a);border-radius:var(--dsw-radius-sm,8px);cursor:pointer}
@@ -1288,3 +1381,4 @@ module.exports.payloadFrom = payloadFrom;
 module.exports.validate = validate;
 module.exports.draftFrom = draftFrom;
 module.exports.filterServers = filterServers;
+module.exports.compareVersions = compareVersions;
