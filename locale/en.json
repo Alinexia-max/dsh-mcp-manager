@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "MCP Servers",
+    "description": "Add, connect and toggle MCP servers from Settings; their tools appear as mcp__<server>__<tool> in chat."
+  }
+}

@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="MCP Manager">
+  <rect x="4" y="4" width="56" height="56" rx="14" fill="#1f6feb" />
+  <path d="M20 44V20l12 14 12-14v24" fill="none" stroke="#ffffff" stroke-width="4.5" stroke-linecap="round" stroke-linejoin="round" />
+  <circle cx="20" cy="20" r="3.5" fill="#ffffff" />
+  <circle cx="44" cy="20" r="3.5" fill="#ffffff" />
+</svg>

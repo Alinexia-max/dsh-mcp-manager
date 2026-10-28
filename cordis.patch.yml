@@ -1,0 +1,7 @@
+# dsh-mcp-manager bundle patch
+#
+# `dsh plugin --profile web add ./dsh-mcp-manager` 会读取本文件并插入下面的 row。
+# config.enabled 只控制“启动时是否自动重连已启用的服务器”，面板本身始终可用。
+- insert:
+    - id: mcp-manager
+      name: '@local/dsh-mcp-manager'

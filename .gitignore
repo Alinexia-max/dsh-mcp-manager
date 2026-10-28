@@ -1,0 +1,6 @@
+node_modules/
+*.log
+*.tgz
+.dsh-mcp-manager-build-*
+.DS_Store
+# lib/ 是发布产物，需要提交（GitHub 直装时不跑构建）
