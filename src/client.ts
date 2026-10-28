@@ -90,14 +90,22 @@ function iconRefresh(): React.ReactElement {
   );
 }
 
+/** 两层机箱 + 指示灯的形状表；面板标题（React）与设置导航（DOM）共用一份。 */
+const SERVER_ICON_SHAPES: ReadonlyArray<readonly [string, Record<string, string>]> = [
+  ["rect", { x: "3", y: "4", width: "18", height: "6", rx: "2" }],
+  ["rect", { x: "3", y: "14", width: "18", height: "6", rx: "2" }],
+  ["path", { d: "M7 7h.01" }],
+  ["path", { d: "M7 17h.01" }],
+];
+
 /** 面板标题左侧的图标：两层机箱 + 指示灯，呼应“MCP 服务器”而非宿主的齿轮。 */
-function iconServers(): React.ReactElement {
+function iconServers(size = 20): React.ReactElement {
   return h(
     "svg",
     {
       viewBox: "0 0 24 24",
-      width: 20,
-      height: 20,
+      width: size,
+      height: size,
       fill: "none",
       stroke: "currentColor",
       strokeWidth: 1.6,
@@ -106,10 +114,7 @@ function iconServers(): React.ReactElement {
       "aria-hidden": "true",
       focusable: "false",
     },
-    h("rect", { x: 3, y: 4, width: 18, height: 6, rx: 2 }),
-    h("rect", { x: 3, y: 14, width: 18, height: 6, rx: 2 }),
-    h("path", { d: "M7 7h.01" }),
-    h("path", { d: "M7 17h.01" }),
+    SERVER_ICON_SHAPES.map(([tag, attrs], index) => h(tag, { key: index, ...attrs })),
   );
 }
 
@@ -1180,8 +1185,85 @@ const CSS = `
 
 const inject = ["slots", "locale"];
 
+/** 宿主设置导航行的 CSS Modules 类名后缀；宿主改版导致选择器落空时补丁静默失效。 */
+const NAV_CELL_SELECTOR = '[class*="_navCell"]';
+const NAV_LABEL_SELECTOR = '[class*="_navLabel"]';
+const NAV_ICON_SELECTOR = '[class*="_navIcon"]';
+const NAV_PATCHED_ATTR = "data-dsmm-nav-icon";
+
+/** 用同一份形状表造 DOM 版图标；尺寸与 class 沿用被替换的宿主图标，配色跟随主题。 */
+function createServerIcon(size: string | null, className: string | null): SVGElement {
+  const svgNs = "http://www.w3.org/2000/svg";
+  const svg = document.createElementNS(svgNs, "svg");
+  svg.setAttribute("viewBox", "0 0 24 24");
+  svg.setAttribute("width", size ?? "16");
+  svg.setAttribute("height", size ?? "16");
+  svg.setAttribute("fill", "none");
+  svg.setAttribute("stroke", "currentColor");
+  svg.setAttribute("stroke-width", "1.6");
+  svg.setAttribute("stroke-linecap", "round");
+  svg.setAttribute("stroke-linejoin", "round");
+  svg.setAttribute("aria-hidden", "true");
+  if (className !== null) svg.setAttribute("class", className);
+  for (const [tag, attrs] of SERVER_ICON_SHAPES) {
+    const shape = document.createElementNS(svgNs, tag);
+    for (const [key, value] of Object.entries(attrs)) shape.setAttribute(key, value);
+    svg.appendChild(shape);
+  }
+  return svg;
+}
+
+/**
+ * 宿主按 section id 硬编码设置导航图标（未知 id 一律用齿轮），注册项没有 icon 字段，
+ * 因此只能在客户端把本分区那一行的齿轮换成服务器图标：按导航文本定位行，替换行内 svg。
+ * 面板本体不依赖这段补丁，选择器失配时只是保留宿主默认图标。
+ */
+function patchSettingsNavIcon(): () => void {
+  const noop = () => undefined;
+  if (typeof document === "undefined" || typeof MutationObserver === "undefined") return noop;
+  const titles = new Set([DICT.zh.title, DICT.en.title]);
+  const patch = () => {
+    for (const label of Array.from(document.querySelectorAll(NAV_LABEL_SELECTOR))) {
+      if (!titles.has((label.textContent ?? "").trim())) continue;
+      const cell = label.closest(NAV_CELL_SELECTOR);
+      if (cell === null) continue;
+      const icons = Array.from(cell.querySelectorAll(NAV_ICON_SELECTOR));
+      const patched = icons.find((node) => node.getAttribute(NAV_PATCHED_ATTR) === "1");
+      if (patched !== undefined) {
+        // React 重渲染可能把宿主齿轮塞回来；保留补丁图标，删掉复发的那一个。
+        for (const node of icons) if (node !== patched) node.remove();
+        continue;
+      }
+      const original = icons[0];
+      if (original === undefined) continue;
+      const replacement = createServerIcon(original.getAttribute("width"), original.getAttribute("class"));
+      replacement.setAttribute(NAV_PATCHED_ATTR, "1");
+      original.replaceWith(replacement);
+      for (const node of icons.slice(1)) node.remove();
+    }
+  };
+  let pending = false;
+  const schedule = () => {
+    if (pending) return;
+    pending = true;
+    queueMicrotask(() => {
+      pending = false;
+      patch();
+    });
+  };
+  const observer = new MutationObserver(schedule);
+  observer.observe(document.body ?? document.documentElement, {
+    childList: true,
+    subtree: true,
+    characterData: true,
+  });
+  patch();
+  return () => observer.disconnect();
+}
+
 function apply(ctx: ClientContext): void {
   ctx.effect(() => ctx.locale.register(NS, DICT), "mcp-manager: locale");
+  ctx.effect(() => patchSettingsNavIcon(), "mcp-manager: settings nav icon");
   ctx.slots.inject("settings.section", () =>
     ctx.slots.register(
       {
