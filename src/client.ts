@@ -849,7 +849,8 @@ function Section(props: SectionProps): React.ReactElement {
   const [keyword, setKeyword] = React.useState("");
   const [sourceFilter, setSourceFilter] = React.useState<SourceId | "all">("all");
   const [phaseFilter, setPhaseFilter] = React.useState<Phase | "all">("all");
-  const [collapsed, setCollapsed] = React.useState<Record<string, boolean>>({});
+  // 记录“已展开”的分组；默认空对象即全部分组折叠，只显示来源与配置文件路径。
+  const [expanded, setExpanded] = React.useState<Record<string, boolean>>({});
   const [update, setUpdate] = React.useState<UpdateNote | null>(null);
   const alive = React.useRef(true);
 
@@ -992,7 +993,7 @@ function Section(props: SectionProps): React.ReactElement {
 
   const groupSection = (entry: { group: SourceGroup; servers: ServerView[] }) => {
     const { group, servers } = entry;
-    const folded = collapsed[group.id] === true;
+    const folded = expanded[group.id] !== true;
     return h(
       "section",
       { className: "dsmm-group", key: group.id, "data-source": group.id },
@@ -1003,7 +1004,7 @@ function Section(props: SectionProps): React.ReactElement {
           role: "button",
           tabIndex: 0,
           "aria-expanded": !folded,
-          onClick: () => setCollapsed({ ...collapsed, [group.id]: !folded }),
+          onClick: () => setExpanded({ ...expanded, [group.id]: folded }),
         },
         h("span", { className: "dsmm-group-caret", "aria-hidden": "true" }, folded ? "▸" : "▾"),
         h("span", { className: "dsmm-group-name" }, group.id === "dsh" ? t("group.dsh") : t("group.codebuddy")),
