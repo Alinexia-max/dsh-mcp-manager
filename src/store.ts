@@ -13,12 +13,25 @@ import { dirname, join } from "node:path";
 
 export type Transport = "stdio" | "streamable-http";
 
+/** 上游 `dsh-mcp-client` 的重连策略；未设置的字段由上游用自己的默认值（500ms→30s，10 次）。 */
+export interface ReconnectPolicy {
+  enabled?: boolean;
+  initialDelayMs?: number;
+  maxDelayMs?: number;
+  maxAttempts?: number;
+}
+
 /** 回传给前端的密钥占位符；写回时该值表示“沿用旧值”。 */
 export const SECRET_MASK = "***";
 export const DEFAULT_TOOL_CALL_TIMEOUT_MS = 60_000;
 export const SERVER_NAME_PATTERN = /^[A-Za-z0-9_-]{1,32}$/;
 const MIN_TOOL_CALL_TIMEOUT_MS = 1_000;
 const MAX_TOOL_CALL_TIMEOUT_MS = 600_000;
+const MIN_RECONNECT_DELAY_MS = 100;
+const MAX_RECONNECT_DELAY_MS = 600_000;
+const MAX_RECONNECT_ATTEMPTS = 100;
+const MIN_INSTRUCTION_BYTES = 1_024;
+const MAX_INSTRUCTION_BYTES = 1_048_576;
 
 export interface CodedError extends Error {
   statusCode?: number;
@@ -55,6 +68,10 @@ export interface ServerRecord {
   url?: string;
   headers?: Record<string, string>;
   toolCallTimeoutMs?: number;
+  /** 重连策略；缺省即全用上游默认。 */
+  reconnect?: ReconnectPolicy;
+  /** 服务器指令（instructions）的字节上限；缺省用上游 32768。 */
+  maxInstructionBytes?: number;
   createdAt: string;
   updatedAt: string;
 }
@@ -76,6 +93,8 @@ export interface ServerInput {
   url?: string;
   headers?: Record<string, string>;
   toolCallTimeoutMs?: number;
+  reconnect?: ReconnectPolicy;
+  maxInstructionBytes?: number;
 }
 
 export function resolveDshHome(): string {
@@ -167,6 +186,10 @@ function normalizeRecord(value: unknown): ServerRecord | undefined {
     ...(typeof raw.url === "string" && raw.url !== "" ? { url: raw.url } : {}),
     ...(plainStrings(raw.headers) ? { headers: plainStrings(raw.headers) } : {}),
     ...(typeof raw.toolCallTimeoutMs === "number" ? { toolCallTimeoutMs: raw.toolCallTimeoutMs } : {}),
+    ...(readReconnect(raw.reconnect) === undefined ? {} : { reconnect: readReconnect(raw.reconnect) }),
+    ...(typeof raw.maxInstructionBytes === "number" && raw.maxInstructionBytes > 0
+      ? { maxInstructionBytes: raw.maxInstructionBytes }
+      : {}),
     createdAt: typeof raw.createdAt === "string" ? raw.createdAt : new Date().toISOString(),
     updatedAt: typeof raw.updatedAt === "string" ? raw.updatedAt : new Date().toISOString(),
   };
@@ -213,6 +236,54 @@ function stringList(value: unknown, field: string): string[] | undefined {
   });
 }
 
+/** 读盘用：只认合法字段，不做严格范围校验，避免历史文件因上游默认值变化而读不出来。 */
+function readReconnect(value: unknown): ReconnectPolicy | undefined {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const raw = value as Record<string, unknown>;
+  const policy: ReconnectPolicy = {};
+  if (typeof raw.enabled === "boolean") policy.enabled = raw.enabled;
+  for (const key of ["initialDelayMs", "maxDelayMs", "maxAttempts"] as const) {
+    const item = raw[key];
+    if (typeof item === "number" && Number.isInteger(item) && item > 0) policy[key] = item;
+  }
+  return Object.keys(policy).length === 0 ? undefined : policy;
+}
+
+function integerInRange(value: unknown, min: number, max: number, field: string): number | undefined {
+  if (value === undefined || value === null || value === "") return undefined;
+  const parsed = typeof value === "number" ? value : Number(value);
+  if (!Number.isInteger(parsed) || parsed < min || parsed > max) {
+    throw coded(400, `error.input.${field}`, `${field} 必须是 ${min}~${max} 的整数`);
+  }
+  return parsed;
+}
+
+/** 请求体里的重连策略：逐字段校验，任何一项越界都整体拒绝，避免半套策略落盘。 */
+function parseReconnect(value: unknown): ReconnectPolicy | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== "object" || Array.isArray(value)) {
+    throw coded(400, "error.input.reconnect", "reconnect 必须是对象");
+  }
+  const raw = value as Record<string, unknown>;
+  const policy: ReconnectPolicy = {};
+  if (typeof raw.enabled === "boolean") policy.enabled = raw.enabled;
+  const initialDelayMs = integerInRange(
+    raw.initialDelayMs,
+    MIN_RECONNECT_DELAY_MS,
+    MAX_RECONNECT_DELAY_MS,
+    "reconnect.initialDelayMs",
+  );
+  if (initialDelayMs !== undefined) policy.initialDelayMs = initialDelayMs;
+  const maxDelayMs = integerInRange(raw.maxDelayMs, MIN_RECONNECT_DELAY_MS, MAX_RECONNECT_DELAY_MS, "reconnect.maxDelayMs");
+  if (maxDelayMs !== undefined) policy.maxDelayMs = maxDelayMs;
+  const maxAttempts = integerInRange(raw.maxAttempts, 1, MAX_RECONNECT_ATTEMPTS, "reconnect.maxAttempts");
+  if (maxAttempts !== undefined) policy.maxAttempts = maxAttempts;
+  if (policy.initialDelayMs !== undefined && policy.maxDelayMs !== undefined && policy.maxDelayMs < policy.initialDelayMs) {
+    throw coded(400, "error.input.reconnect", "重连最大延迟不能小于初始延迟");
+  }
+  return Object.keys(policy).length === 0 ? undefined : policy;
+}
+
 /** 校验并归一化请求体；失败抛 400（错误码给前端做本地化替换）。 */
 export function parseInput(raw: unknown): ServerInput {
   if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
@@ -243,6 +314,20 @@ export function parseInput(raw: unknown): ServerInput {
 
   const enabled = body.enabled === undefined ? true : body.enabled !== false;
 
+  const reconnect = parseReconnect(body.reconnect);
+  const maxInstructionBytes = integerInRange(
+    body.maxInstructionBytes,
+    MIN_INSTRUCTION_BYTES,
+    MAX_INSTRUCTION_BYTES,
+    "maxInstructionBytes",
+  );
+  // 两种传输共用的可选字段，省一次重复。
+  const extras = {
+    ...(toolCallTimeoutMs === undefined ? {} : { toolCallTimeoutMs }),
+    ...(reconnect === undefined ? {} : { reconnect }),
+    ...(maxInstructionBytes === undefined ? {} : { maxInstructionBytes }),
+  };
+
   if (transport === "stdio") {
     const command = text(body.command);
     if (command === undefined) throw coded(400, "error.input.command", "stdio 传输必须填写命令");
@@ -254,7 +339,7 @@ export function parseInput(raw: unknown): ServerInput {
       args: stringList(body.args, "args") ?? [],
       env: keyValueObject(body.env, "env") ?? {},
       ...(text(body.cwd) === undefined ? {} : { cwd: text(body.cwd) }),
-      ...(toolCallTimeoutMs === undefined ? {} : { toolCallTimeoutMs }),
+      ...extras,
     };
   }
 
@@ -275,7 +360,7 @@ export function parseInput(raw: unknown): ServerInput {
     enabled,
     url: parsedUrl.href,
     headers: keyValueObject(body.headers, "headers") ?? {},
-    ...(toolCallTimeoutMs === undefined ? {} : { toolCallTimeoutMs }),
+    ...extras,
   };
 }
 
@@ -305,6 +390,9 @@ export function applyInput(input: ServerInput, previous?: ServerRecord): ServerR
     serverName: input.serverName,
     enabled: input.enabled,
     transport: input.transport,
+    ...(input.toolCallTimeoutMs === undefined ? {} : { toolCallTimeoutMs: input.toolCallTimeoutMs }),
+    ...(input.reconnect === undefined ? {} : { reconnect: input.reconnect }),
+    ...(input.maxInstructionBytes === undefined ? {} : { maxInstructionBytes: input.maxInstructionBytes }),
     createdAt: previous?.createdAt ?? now,
     updatedAt: now,
   };
@@ -317,7 +405,6 @@ export function applyInput(input: ServerInput, previous?: ServerRecord): ServerR
       args: input.args ?? [],
       ...(env === undefined ? {} : { env }),
       ...(input.cwd === undefined ? {} : { cwd: input.cwd }),
-      ...(input.toolCallTimeoutMs === undefined ? {} : { toolCallTimeoutMs: input.toolCallTimeoutMs }),
     };
   }
 
@@ -326,7 +413,6 @@ export function applyInput(input: ServerInput, previous?: ServerRecord): ServerR
     ...base,
     url: input.url,
     ...(headers === undefined ? {} : { headers }),
-    ...(input.toolCallTimeoutMs === undefined ? {} : { toolCallTimeoutMs: input.toolCallTimeoutMs }),
   };
 }
 
@@ -347,8 +433,11 @@ export function maskRecord(record: ServerRecord): ServerRecord {
 export function toMcpConfig(record: ServerRecord): Record<string, unknown> {
   const common = {
     serverName: record.serverName,
+    // 面板依赖 fiber 的 reject 展示失败状态，所以这里始终让启动错误冒出来。
     failOnStartupError: true,
     toolCallTimeoutMs: record.toolCallTimeoutMs ?? DEFAULT_TOOL_CALL_TIMEOUT_MS,
+    ...(record.reconnect === undefined ? {} : { reconnect: record.reconnect }),
+    ...(record.maxInstructionBytes === undefined ? {} : { maxInstructionBytes: record.maxInstructionBytes }),
   };
   if (record.transport === "stdio") {
     return {

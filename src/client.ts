@@ -5,6 +5,7 @@ import { resolveApiUrl } from "./api-base.js";
 import type {
   ClientContext,
   DiscoveredTransport,
+  ImportJsonResult,
   ManagerState,
   Phase,
   SectionProps,
@@ -224,6 +225,34 @@ const DICT: Record<string, Record<string, string>> = {
     "error.command": "stdio 传输必须填写命令",
     "error.url": "streamable-http 传输必须填写 http(s) 地址",
     "error.timeout": "调用超时必须是 1000~600000 的整数",
+    // 多来源聚合、粘贴导入与重连策略。
+    "group.claude": "Claude",
+    "group.cursor": "Cursor",
+    "group.vscode": "VS Code",
+    "status.exhausted": "已停止重连",
+    "status.exhausted.hint": "工具已被移除：上游重连预算用尽，点「重连」或重启 DSH 恢复。",
+    "btn.pasteImport": "粘贴导入",
+    "importJson.title": "粘贴导入服务器",
+    "importJson.hint": '支持 {"mcpServers": {…}} 或 {"servers": {…}} 片段；同名、名称不合法或不支持的条目会被跳过。',
+    "importJson.placeholder": '{\n  "mcpServers": {\n    "demo": { "command": "npx", "args": ["-y", "@modelcontextprotocol/server-everything"] }\n  }\n}',
+    "importJson.done": "已导入 {imported} 个，跳过 {skipped} 个",
+    "importJson.skippedTitle": "跳过原因：",
+    "tools.search": "搜索工具名或描述",
+    "tools.copy": "复制",
+    "tools.copied": "已复制",
+    "field.reconnect": "自动重连",
+    "field.reconnect.hint": "留空即用上游默认值：首次 500ms、上限 30s、最多 10 次。预算用尽后工具会被移除。",
+    "field.reconnectEnabled": "断开后自动重连",
+    "field.reconnectInitial": "首次重连延迟（毫秒）",
+    "field.reconnectMax": "重连最大延迟（毫秒）",
+    "field.reconnectAttempts": "连续失败上限（次）",
+    "field.instructionBytes": "服务器指令上限（字节）",
+    "field.instructionBytes.hint": "留空使用上游默认 32768",
+    "btn.on": "开",
+    "btn.off": "关",
+    "error.reconnect": "重连延迟必须是 100~600000 的整数，且最大延迟不小于初始延迟",
+    "error.reconnectAttempts": "重连次数必须是 1~100 的整数",
+    "error.instructionBytes": "指令上限必须是 1024~1048576 的整数",
   },
   en: {
     title: "MCP Servers",
@@ -303,6 +332,34 @@ const DICT: Record<string, Record<string, string>> = {
     "error.command": "stdio transport requires a command",
     "error.url": "streamable-http transport requires an http(s) URL",
     "error.timeout": "Timeout must be an integer between 1000 and 600000",
+    // Extra sources, paste import and reconnect policy.
+    "group.claude": "Claude",
+    "group.cursor": "Cursor",
+    "group.vscode": "VS Code",
+    "status.exhausted": "Reconnect stopped",
+    "status.exhausted.hint": "Tools were removed: the upstream reconnect budget ran out. Click Reconnect, or restart DSH.",
+    "btn.pasteImport": "Paste import",
+    "importJson.title": "Import servers from JSON",
+    "importJson.hint": 'Accepts {"mcpServers": {…}} or {"servers": {…}}; duplicates, invalid names and unsupported transports are skipped.',
+    "importJson.placeholder": '{\n  "mcpServers": {\n    "demo": { "command": "npx", "args": ["-y", "@modelcontextprotocol/server-everything"] }\n  }\n}',
+    "importJson.done": "Imported {imported}, skipped {skipped}",
+    "importJson.skippedTitle": "Skipped:",
+    "tools.search": "Search tool name or description",
+    "tools.copy": "Copy",
+    "tools.copied": "Copied",
+    "field.reconnect": "Auto reconnect",
+    "field.reconnect.hint": "Leave empty to use upstream defaults: 500ms first delay, 30s cap, 10 attempts. Tools are removed once the budget runs out.",
+    "field.reconnectEnabled": "Reconnect after disconnect",
+    "field.reconnectInitial": "First reconnect delay (ms)",
+    "field.reconnectMax": "Max reconnect delay (ms)",
+    "field.reconnectAttempts": "Max consecutive failures",
+    "field.instructionBytes": "Server instructions limit (bytes)",
+    "field.instructionBytes.hint": "Leave empty to use the 32768 default",
+    "btn.on": "On",
+    "btn.off": "Off",
+    "error.reconnect": "Reconnect delays must be 100~600000 and the max must not be below the initial delay",
+    "error.reconnectAttempts": "Reconnect attempts must be an integer between 1 and 100",
+    "error.instructionBytes": "Instructions limit must be an integer between 1024 and 1048576",
   },
 };
 
@@ -364,6 +421,11 @@ interface Draft {
   url: string;
   headers: string;
   toolCallTimeoutMs: string;
+  reconnectEnabled: boolean;
+  reconnectInitialDelayMs: string;
+  reconnectMaxDelayMs: string;
+  reconnectMaxAttempts: string;
+  maxInstructionBytes: string;
 }
 
 function pairsToText(pairs?: Record<string, string>): string {
@@ -410,8 +472,15 @@ function draftFrom(server: ServerView | null): Draft {
       url: "",
       headers: "",
       toolCallTimeoutMs: "",
+      reconnectEnabled: true,
+      reconnectInitialDelayMs: "",
+      reconnectMaxDelayMs: "",
+      reconnectMaxAttempts: "",
+      maxInstructionBytes: "",
     };
   }
+  const reconnect = server.reconnect;
+  const numberText = (value?: number) => (value === undefined ? "" : String(value));
   return {
     id: server.id,
     serverName: server.serverName,
@@ -423,7 +492,12 @@ function draftFrom(server: ServerView | null): Draft {
     cwd: server.cwd ?? "",
     url: server.url ?? "",
     headers: pairsToText(server.headers),
-    toolCallTimeoutMs: server.toolCallTimeoutMs === undefined ? "" : String(server.toolCallTimeoutMs),
+    toolCallTimeoutMs: numberText(server.toolCallTimeoutMs),
+    reconnectEnabled: reconnect?.enabled !== false,
+    reconnectInitialDelayMs: numberText(reconnect?.initialDelayMs),
+    reconnectMaxDelayMs: numberText(reconnect?.maxDelayMs),
+    reconnectMaxAttempts: numberText(reconnect?.maxAttempts),
+    maxInstructionBytes: numberText(server.maxInstructionBytes),
   };
 }
 
@@ -443,6 +517,16 @@ function payloadFrom(draft: Draft): Record<string, unknown> {
     payload.headers = textToPairs(draft.headers);
   }
   if (draft.toolCallTimeoutMs.trim() !== "") payload.toolCallTimeoutMs = Number(draft.toolCallTimeoutMs);
+  // 重连策略：enabled 总是显式传，延迟留空则交给上游默认值。
+  const reconnect: Record<string, unknown> = { enabled: draft.reconnectEnabled };
+  const delays: Array<[string, string]> = [
+    ["initialDelayMs", draft.reconnectInitialDelayMs],
+    ["maxDelayMs", draft.reconnectMaxDelayMs],
+    ["maxAttempts", draft.reconnectMaxAttempts],
+  ];
+  for (const [key, text] of delays) if (text.trim() !== "") reconnect[key] = Number(text);
+  payload.reconnect = reconnect;
+  if (draft.maxInstructionBytes.trim() !== "") payload.maxInstructionBytes = Number(draft.maxInstructionBytes);
   return payload;
 }
 
@@ -459,6 +543,20 @@ function validate(draft: Draft, t: Translate): string | null {
     const value = Number(draft.toolCallTimeoutMs);
     if (!Number.isInteger(value) || value < 1000 || value > 600000) return t("error.timeout");
   }
+  const inRange = (text: string, min: number, max: number) => {
+    const value = Number(text);
+    return Number.isInteger(value) && value >= min && value <= max;
+  };
+  const initial = draft.reconnectInitialDelayMs.trim();
+  const maxDelay = draft.reconnectMaxDelayMs.trim();
+  if ((initial !== "" && !inRange(initial, 100, 600000)) || (maxDelay !== "" && !inRange(maxDelay, 100, 600000))) {
+    return t("error.reconnect");
+  }
+  if (initial !== "" && maxDelay !== "" && Number(maxDelay) < Number(initial)) return t("error.reconnect");
+  const attempts = draft.reconnectMaxAttempts.trim();
+  if (attempts !== "" && !inRange(attempts, 1, 100)) return t("error.reconnectAttempts");
+  const bytes = draft.maxInstructionBytes.trim();
+  if (bytes !== "" && !inRange(bytes, 1024, 1048576)) return t("error.instructionBytes");
   return null;
 }
 
@@ -470,6 +568,8 @@ function statusLabel(t: Translate, phase: ServerView["phase"]): string {
       return t("status.connecting");
     case "error":
       return t("status.error");
+    case "exhausted":
+      return t("status.exhausted");
     case "external":
       return t("status.external");
     default:
@@ -610,6 +710,9 @@ function ServerRow(props: {
           : h("div", { className: "dsmm-command" }, server.url)
         : h("div", { className: "dsmm-command" }, `${server.command} ${linesToText(server.args)}`.trim()),
       server.error === undefined ? null : h("div", { className: "dsmm-row-error" }, server.error),
+      server.phase === "exhausted"
+        ? h("div", { className: "dsmm-row-note" }, t("status.exhausted.hint"))
+        : null,
     ),
     h(
       "div",
@@ -784,6 +887,69 @@ function ServerForm(props: {
               update("toolCallTimeoutMs", event.target.value),
           }),
         ),
+        h(
+          Field,
+          { label: t("field.instructionBytes"), hint: t("field.instructionBytes.hint") },
+          h(Input, {
+            value: draft.maxInstructionBytes,
+            inputMode: "numeric",
+            onChange: (event: React.ChangeEvent<HTMLInputElement>) =>
+              update("maxInstructionBytes", event.target.value),
+          }),
+        ),
+      ),
+      h("div", { className: "dsmm-subhead" }, t("field.reconnect")),
+      h(
+        "div",
+        { className: "dsmm-form-grid" },
+        h(
+          Field,
+          { label: t("field.reconnectEnabled"), hint: t("field.reconnect.hint") },
+          h(
+            "div",
+            { className: "dsmm-segmented" },
+            h(
+              Button,
+              {
+                variant: draft.reconnectEnabled ? "primary" : "ghost",
+                size: "sm",
+                disabled: props.busy,
+                onClick: () => update("reconnectEnabled", !draft.reconnectEnabled),
+              },
+              draft.reconnectEnabled ? t("btn.on") : t("btn.off"),
+            ),
+          ),
+        ),
+        h(
+          Field,
+          { label: t("field.reconnectInitial") },
+          h(Input, {
+            value: draft.reconnectInitialDelayMs,
+            inputMode: "numeric",
+            onChange: (event: React.ChangeEvent<HTMLInputElement>) =>
+              update("reconnectInitialDelayMs", event.target.value),
+          }),
+        ),
+        h(
+          Field,
+          { label: t("field.reconnectMax") },
+          h(Input, {
+            value: draft.reconnectMaxDelayMs,
+            inputMode: "numeric",
+            onChange: (event: React.ChangeEvent<HTMLInputElement>) =>
+              update("reconnectMaxDelayMs", event.target.value),
+          }),
+        ),
+        h(
+          Field,
+          { label: t("field.reconnectAttempts") },
+          h(Input, {
+            value: draft.reconnectMaxAttempts,
+            inputMode: "numeric",
+            onChange: (event: React.ChangeEvent<HTMLInputElement>) =>
+              update("reconnectMaxAttempts", event.target.value),
+          }),
+        ),
       ),
       h("p", { className: "dsmm-note" }, t("form.secretNote")),
       localError === null ? null : h("div", { className: "dsmm-alert", role: "alert" }, localError),
@@ -797,6 +963,49 @@ function ServerForm(props: {
   });
 }
 
+/** 粘贴一段 mcpServers 片段批量建服务器；解析与跳过规则都在 Host 侧。 */
+function ImportJsonDialog(props: {
+  t: Translate;
+  busy: boolean;
+  onClose: () => void;
+  onSubmit: (text: string) => void;
+}): React.ReactElement {
+  const { t } = props;
+  const [text, setText] = React.useState("");
+  return h(Modal, {
+    open: true,
+    onClose: props.onClose,
+    title: t("importJson.title"),
+    closeLabel: t("btn.close"),
+    children: h(
+      "div",
+      { className: "dsmm-form" },
+      h("p", { className: "dsmm-note" }, t("importJson.hint")),
+      h("textarea", {
+        className: "dsmm-textarea",
+        rows: 10,
+        value: text,
+        placeholder: t("importJson.placeholder"),
+        onChange: (event: React.ChangeEvent<HTMLTextAreaElement>) => setText(event.target.value),
+      }),
+    ),
+    footer: h(
+      "div",
+      { className: "dsmm-form-footer" },
+      h(Button, { variant: "ghost", onClick: props.onClose, disabled: props.busy }, t("btn.cancel")),
+      h(
+        Button,
+        {
+          variant: "primary",
+          onClick: () => props.onSubmit(text),
+          disabled: props.busy || text.trim() === "",
+        },
+        t("btn.import"),
+      ),
+    ),
+  });
+}
+
 function ToolsDialog(props: {
   server: ServerView;
   tools: ToolView[];
@@ -804,6 +1013,31 @@ function ToolsDialog(props: {
   onClose: () => void;
 }): React.ReactElement {
   const { server, tools, t } = props;
+  const [keyword, setKeyword] = React.useState("");
+  const [copied, setCopied] = React.useState<string | null>(null);
+
+  // 复制反馈只停留两秒，避免“已复制”一直挂在那儿。
+  React.useEffect(() => {
+    if (copied === null) return;
+    const timer = setTimeout(() => setCopied(null), 2000);
+    return () => clearTimeout(timer);
+  }, [copied]);
+
+  const query = keyword.trim().toLowerCase();
+  const visible =
+    query === "" ? tools : tools.filter((tool) => `${tool.name} ${tool.description}`.toLowerCase().includes(query));
+
+  /** 复制带服务器前缀的完整工具名，可直接粘进提示词或权限规则。 */
+  function copy(name: string): void {
+    if (typeof navigator === "undefined") return;
+    const clipboard = navigator.clipboard as Clipboard | undefined;
+    if (clipboard === undefined) return;
+    clipboard.writeText(name).then(
+      () => setCopied(name),
+      () => setCopied(null),
+    );
+  }
+
   return h(Modal, {
     open: true,
     onClose: props.onClose,
@@ -814,12 +1048,37 @@ function ToolsDialog(props: {
       { className: "dsmm-tools" },
       tools.length === 0
         ? h("div", { className: "dsmm-empty" }, t("tools.empty"))
-        : tools.map((tool) =>
+        : h(
+            React.Fragment,
+            null,
+            h("input", {
+              className: "dsmm-search",
+              type: "search",
+              "aria-label": t("tools.search"),
+              placeholder: t("tools.search"),
+              value: keyword,
+              onChange: (event: React.ChangeEvent<HTMLInputElement>) => setKeyword(event.target.value),
+            }),
+            h("div", { className: "dsmm-tools-count" }, format(t("tools.count"), { count: visible.length })),
             h(
               "div",
-              { className: "dsmm-tool", key: tool.name },
-              h("div", { className: "dsmm-tool-name" }, tool.name),
-              h("div", { className: "dsmm-tool-desc" }, tool.description === "" ? "—" : tool.description),
+              { className: "dsmm-tool-list" },
+              visible.length === 0
+                ? h("div", { className: "dsmm-empty" }, t("empty.filtered"))
+                : visible.map((tool) =>
+                    h(
+                      "div",
+                      { className: "dsmm-tool", key: tool.name },
+                      h(
+                        "div",
+                        { className: "dsmm-tool-head" },
+                        h("div", { className: "dsmm-tool-name" }, tool.name),
+                        copied === tool.name ? h("span", { className: "dsmm-copied" }, t("tools.copied")) : null,
+                        h(Button, { variant: "ghost", size: "sm", onClick: () => copy(tool.name) }, t("tools.copy")),
+                      ),
+                      h("div", { className: "dsmm-tool-desc" }, tool.description === "" ? "—" : tool.description),
+                    ),
+                  ),
             ),
           ),
     ),
@@ -852,6 +1111,8 @@ function Section(props: SectionProps): React.ReactElement {
   // 记录“已展开”的分组；默认空对象即全部分组折叠，只显示来源与配置文件路径。
   const [expanded, setExpanded] = React.useState<Record<string, boolean>>({});
   const [update, setUpdate] = React.useState<UpdateNote | null>(null);
+  const [importText, setImportText] = React.useState<string | null>(null);
+  const [importResult, setImportResult] = React.useState<ImportJsonResult | null>(null);
   const alive = React.useRef(true);
 
   React.useEffect(() => {
@@ -875,6 +1136,15 @@ function Section(props: SectionProps): React.ReactElement {
 
   React.useEffect(() => {
     void refresh();
+  }, [refresh]);
+
+  // 挂载与重连都是异步的，宿主也没有推送通道，所以定时回拉一次，让「连接中 → 已连接」自己变。
+  React.useEffect(() => {
+    const timer = setInterval(() => {
+      if (typeof document !== "undefined" && document.hidden) return;
+      void refresh();
+    }, 5000);
+    return () => clearInterval(timer);
   }, [refresh]);
 
   function mutate(task: () => Promise<unknown>): Promise<boolean> {
@@ -950,10 +1220,33 @@ function Section(props: SectionProps): React.ReactElement {
     void mutate(() => postJson("/import", { source: server.origin, name: server.serverName }));
   }
 
+  /** 批量导入要回传逐条结果，所以不复用 mutate（它只返回成功与否）。 */
+  function submitImport(text: string): void {
+    setBusy(true);
+    setError(null);
+    setImportResult(null);
+    postJson<ImportJsonResult>("/import-json", { json: text })
+      .then((result) => {
+        if (!alive.current) return;
+        setImportResult(result);
+        setImportText(null);
+        return refresh();
+      })
+      .catch((caught: unknown) => {
+        if (alive.current) setError(messageOf(caught));
+      })
+      .then(() => {
+        if (alive.current) setBusy(false);
+      });
+  }
+
   const groups: SourceGroup[] = state === null ? [] : state.groups ?? [];
+  // 来源文件可能被删掉，这时下拉框里残留的值要退回「全部来源」。
+  const knownSources = new Set<string>(groups.map((group) => group.id));
+  const activeSource: SourceId | "all" = sourceFilter !== "all" && !knownSources.has(sourceFilter) ? "all" : sourceFilter;
 
   const row = (server: ServerView) =>
-    server.origin === "codebuddy"
+    server.origin !== "dsh"
       ? h(DiscoveredRow, {
           key: server.id,
           server,
@@ -979,7 +1272,7 @@ function Section(props: SectionProps): React.ReactElement {
         });
 
   const visibleGroups = groups
-    .filter((group) => sourceFilter === "all" || group.id === sourceFilter)
+    .filter((group) => activeSource === "all" || group.id === activeSource)
     .map((group) => ({
       group,
       servers: filterServers(group.servers, { keyword, source: "all", phase: phaseFilter }),
@@ -1007,7 +1300,7 @@ function Section(props: SectionProps): React.ReactElement {
           onClick: () => setExpanded({ ...expanded, [group.id]: folded }),
         },
         h("span", { className: "dsmm-group-caret", "aria-hidden": "true" }, folded ? "▸" : "▾"),
-        h("span", { className: "dsmm-group-name" }, group.id === "dsh" ? t("group.dsh") : t("group.codebuddy")),
+        h("span", { className: "dsmm-group-name" }, t(`group.${group.id}`)),
         h("span", { className: "dsmm-group-count" }, format(t("group.count"), { count: group.servers.length })),
         group.writable ? null : h("span", { className: "dsmm-group-tag" }, t("group.readonly")),
         h("span", { className: "dsmm-group-path", title: group.configPath }, group.configPath),
@@ -1099,10 +1392,46 @@ function Section(props: SectionProps): React.ReactElement {
                       t("update.open"),
                     ),
               ),
+          importResult === null
+            ? null
+            : h(
+                "p",
+                {
+                  className: "dsmm-update",
+                  "data-tone": importResult.skipped.length === 0 ? "ok" : "warn",
+                  role: "status",
+                },
+                format(t("importJson.done"), {
+                  imported: importResult.imported.length,
+                  skipped: importResult.skipped.length,
+                }),
+                importResult.skipped.length === 0
+                  ? null
+                  : h(
+                      "span",
+                      { className: "dsmm-import-skipped" },
+                      `${t("importJson.skippedTitle")} ${importResult.skipped
+                        .slice(0, 3)
+                        .map((item) => `${item.name}（${item.reason}）`)
+                        .join("；")}`,
+                    ),
+              ),
         ),
         h(
           "div",
           { className: "dsmm-header-actions" },
+          h(
+            Button,
+            {
+              variant: "ghost",
+              disabled: busy || state === null,
+              onClick: () => {
+                setImportResult(null);
+                setImportText("");
+              },
+            },
+            t("btn.pasteImport"),
+          ),
           h(
             Button,
             {
@@ -1122,13 +1451,13 @@ function Section(props: SectionProps): React.ReactElement {
           {
             className: "dsmm-select",
             "aria-label": t("toolbar.source"),
-            value: sourceFilter,
+            value: activeSource,
             onChange: (event: React.ChangeEvent<HTMLSelectElement>) =>
               setSourceFilter(event.target.value as SourceId | "all"),
           },
           h("option", { value: "all" }, t("toolbar.sourceAll")),
-          h("option", { value: "dsh" }, t("group.dsh")),
-          h("option", { value: "codebuddy" }, t("group.codebuddy")),
+          // 只列出实际出现的来源，避免下拉里堆一串空来源。
+          groups.map((group) => h("option", { key: group.id, value: group.id }, t(`group.${group.id}`))),
         ),
         h(
           "select",
@@ -1143,6 +1472,7 @@ function Section(props: SectionProps): React.ReactElement {
           h("option", { value: "ready" }, t("status.ready")),
           h("option", { value: "connecting" }, t("status.connecting")),
           h("option", { value: "error" }, t("status.error")),
+          h("option", { value: "exhausted" }, t("status.exhausted")),
           h("option", { value: "disabled" }, t("status.disabled")),
           h("option", { value: "external" }, t("status.external")),
         ),
@@ -1166,6 +1496,14 @@ function Section(props: SectionProps): React.ReactElement {
         ? null
         : h("p", { className: "dsmm-foot" }, format(t("store.path"), { path: state.storePath })),
     ),
+    importText === null
+      ? null
+      : h(ImportJsonDialog, {
+          t,
+          busy,
+          onClose: () => setImportText(null),
+          onSubmit: submitImport,
+        }),
     draft === null
       ? null
       : h(ServerForm, {
@@ -1250,11 +1588,14 @@ const CSS = `
 .dsmm-meta{font-size:11px;color:var(--dsw-alias-label-tertiary,#9a9a9a)}
 .dsmm-command{font-size:11px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--dsw-alias-label-secondary,#b8b8b8);word-break:break-all}
 .dsmm-row-error{font-size:11px;line-height:1.5;color:var(--dsw-alias-state-error-primary,#e5534b);word-break:break-word}
+.dsmm-row-note{font-size:11px;line-height:1.5;color:var(--dsw-alias-state-warn-primary,#d29922);word-break:break-word}
+.dsmm-import-skipped{font-size:11px;color:var(--dsw-alias-label-tertiary,#9a9a9a)}
 .dsmm-row-actions{display:flex;gap:4px;flex-wrap:wrap;justify-content:flex-end}
 .dsmm-badge{display:inline-flex;align-items:center;padding:1px 8px;border-radius:999px;font-size:11px;line-height:18px;border:0.5px solid var(--dsw-alias-border-l2,#3a3a3a);color:var(--dsw-alias-label-secondary,#b8b8b8)}
 .dsmm-badge[data-phase="ready"]{color:var(--dsw-alias-state-success-primary,#3fb950);border-color:currentColor}
 .dsmm-badge[data-phase="connecting"]{color:var(--dsw-alias-state-warn-primary,#d29922);border-color:currentColor}
 .dsmm-badge[data-phase="error"]{color:var(--dsw-alias-state-error-primary,#e5534b);border-color:currentColor}
+.dsmm-badge[data-phase="exhausted"]{color:var(--dsw-alias-state-warn-primary,#d29922);border-color:currentColor}
 .dsmm-badge[data-phase="external"]{color:var(--dsw-alias-link,#6cb6ff);border-color:currentColor}
 .dsmm-empty{padding:24px 16px;text-align:center;font-size:12px;color:var(--dsw-alias-label-tertiary,#9a9a9a);border:0.5px dashed var(--dsw-alias-border-l2,#3a3a3a);border-radius:var(--dsw-radius-lg,16px)}
 .dsmm-alert{padding:8px 12px;border-radius:var(--dsw-radius-sm,8px);font-size:12px;line-height:1.5;color:var(--dsw-alias-state-error-primary,#e5534b);background:var(--dsw-alias-bg-layer-1,#1c1c1c);border:0.5px solid currentColor;word-break:break-word}
@@ -1263,15 +1604,20 @@ const CSS = `
 .dsmm-form-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px}
 .dsmm-field{display:flex;flex-direction:column;gap:4px;min-width:0}
 .dsmm-field-label{font-size:12px;font-weight:500;color:var(--dsw-alias-label-primary,#e6e6e6)}
+.dsmm-subhead{margin-top:4px;font-size:12px;font-weight:600;color:var(--dsw-alias-label-secondary,#b8b8b8)}
 .dsmm-field-hint{font-size:11px;line-height:1.4;color:var(--dsw-alias-label-tertiary,#9a9a9a)}
 .dsmm-segmented{display:flex;gap:6px;flex-wrap:wrap}
 .dsmm-textarea{width:100%;box-sizing:border-box;padding:8px 10px;font-size:12px;line-height:1.5;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--dsw-alias-label-primary,#e6e6e6);background:var(--dsw-alias-bg-layer-1,#1c1c1c);border:0.5px solid var(--dsw-alias-border-l2,#3a3a3a);border-radius:var(--dsw-radius-sm,8px);resize:vertical}
 .dsmm-textarea:focus-visible{outline:var(--dsw-focus-ring-width,1px) solid var(--dsw-focus-ring-color,var(--dsw-alias-brand-primary,#4f8cff));outline-offset:1px}
 .dsmm-note{margin:0;font-size:11px;line-height:1.5;color:var(--dsw-alias-label-tertiary,#9a9a9a)}
 .dsmm-form-footer{display:flex;justify-content:flex-end;gap:8px}
-.dsmm-tools{display:flex;flex-direction:column;gap:8px;max-height:50vh;overflow:auto}
+.dsmm-tools{display:flex;flex-direction:column;gap:8px}
+.dsmm-tools-count{font-size:11px;color:var(--dsw-alias-label-tertiary,#9a9a9a)}
+.dsmm-tool-list{display:flex;flex-direction:column;gap:8px;max-height:44vh;overflow:auto}
 .dsmm-tool{padding:8px 10px;border:0.5px solid var(--dsw-alias-border-l1,#2f2f2f);border-radius:var(--dsw-radius-sm,8px);background:var(--dsw-alias-bg-layer-1,#1c1c1c)}
+.dsmm-tool-head{display:flex;align-items:center;gap:8px;justify-content:space-between}
 .dsmm-tool-name{font-size:12px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--dsw-alias-label-primary,#e6e6e6);word-break:break-all}
+.dsmm-copied{flex:none;font-size:11px;color:var(--dsw-alias-state-success-primary,#3fb950)}
 .dsmm-tool-desc{margin-top:2px;font-size:11px;line-height:1.5;color:var(--dsw-alias-label-tertiary,#9a9a9a)}
 @container(max-width:520px){.dsmm-row{flex-direction:column}.dsmm-row-actions{justify-content:flex-start}}
 @media(prefers-reduced-motion:no-preference){.dsmm-row{transition:background-color .12s ease}.dsmm-row:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(255,255,255,.04))}}

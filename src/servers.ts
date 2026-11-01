@@ -4,7 +4,15 @@ import { pathToFileURL } from "node:url";
 
 import type { DiscoveredServer, DiscoveredTransport, SourceGroup, SourceId } from "./client-types.js";
 import type { HostContext, PluginFiber, ToolSchema } from "./host-types.js";
-import { readCodeBuddySource, toDiscovered, type RawSource } from "./discovery.js";
+import {
+  parseMcpConfig,
+  readAllSources,
+  readSource,
+  sourceDefinitions,
+  toDiscovered,
+  type RawServer,
+  type RawSource,
+} from "./discovery.js";
 import {
   applyInput,
   coded,
@@ -16,6 +24,7 @@ import {
   storePath,
   toMcpConfig,
   writeStore,
+  type ReconnectPolicy,
   type ServerInput,
   type ServerRecord,
   type Transport,
@@ -29,7 +38,8 @@ import {
  * 唯一权威的状态信号。
  */
 
-export type Phase = "disabled" | "connecting" | "ready" | "error" | "external";
+/** `exhausted`：连上过、之后断开且工具已消失，通常是上游重连预算用尽。 */
+export type Phase = "disabled" | "connecting" | "ready" | "error" | "exhausted" | "external";
 
 export interface ServerView {
   id: string;
@@ -46,10 +56,12 @@ export interface ServerView {
   url?: string;
   headers?: Record<string, string>;
   toolCallTimeoutMs?: number;
+  reconnect?: ReconnectPolicy;
+  maxInstructionBytes?: number;
   createdAt: string;
   updatedAt: string;
   external: boolean;
-  /** 条目来源；`codebuddy` 的条目只读，只能导入。 */
+  /** 条目来源；非 `dsh` 的条目只读，只能导入。 */
   origin: SourceId;
   importable?: boolean;
   placeholders?: string[];
@@ -86,6 +98,8 @@ export interface Supervisor {
   reconnect(id: string): Promise<ServerView>;
   /** 把只读来源里的一条配置复制成本地服务器；密钥由服务端重新读原文取得。 */
   importServer(raw: unknown): Promise<ServerView>;
+  /** 粘贴一段 mcpServers 片段，批量建成本地服务器；逐条报告成功与跳过原因。 */
+  importJson(raw: unknown): Promise<{ imported: string[]; skipped: Array<{ name: string; reason: string }> }>;
   dispose(): Promise<void>;
 }
 
@@ -107,7 +121,8 @@ interface Mounted {
 export function createSupervisor(options: SupervisorOptions): Supervisor {
   const { ctx, autostart, log } = options;
 
-  const statuses = new Map<string, { phase: Phase; error?: string }>();
+  /** `everReady` 区分「首次连接就失败」与「连上过、现在断开且工具已消失」。 */
+  const statuses = new Map<string, { phase: Phase; error?: string; everReady?: boolean }>();
   const mounted = new Map<string, Mounted>();
   let records: ServerRecord[] = [];
   let storeError: string | undefined;
@@ -205,7 +220,9 @@ export function createSupervisor(options: SupervisorOptions): Supervisor {
   }
 
   async function doMount(record: ServerRecord): Promise<void> {
-    statuses.set(record.id, { phase: "connecting" });
+    // 重连不能抹掉“连上过”的历史，否则无法区分首次失败与重连预算用尽。
+    const everReady = statuses.get(record.id)?.everReady === true;
+    statuses.set(record.id, { phase: "connecting", ...(everReady ? { everReady: true } : {}) });
     let fiber: PluginFiber;
     try {
       if (typeof ctx.plugin !== "function") {
@@ -230,7 +247,7 @@ export function createSupervisor(options: SupervisorOptions): Supervisor {
     void Promise.resolve(fiber as unknown as PromiseLike<unknown>).then(
       () => {
         if (mounted.get(record.id)?.fiber !== fiber) return;
-        statuses.set(record.id, { phase: "ready" });
+        statuses.set(record.id, { phase: "ready", everReady: true });
       },
       (caught: unknown) => {
         if (mounted.get(record.id)?.fiber !== fiber) return;
@@ -267,12 +284,15 @@ export function createSupervisor(options: SupervisorOptions): Supervisor {
 
   function viewOf(record: ServerRecord): ServerView {
     const status = statuses.get(record.id);
-    const phase: Phase = !record.enabled ? "disabled" : status?.phase ?? "disabled";
+    const toolCount = toolCounts().get(record.serverName) ?? 0;
+    let phase: Phase = !record.enabled ? "disabled" : status?.phase ?? "disabled";
+    // 连上过、现在报错且工具已被注销：上游重连预算大概率用尽，需要人工重连或重启。
+    if (phase === "error" && status?.everReady === true && toolCount === 0) phase = "exhausted";
     return {
       ...maskRecord(record),
       phase,
       ...(status?.error === undefined ? {} : { error: status.error }),
-      toolCount: toolCounts().get(record.serverName) ?? 0,
+      toolCount,
       external: false,
       origin: "dsh",
     };
@@ -330,21 +350,13 @@ export function createSupervisor(options: SupervisorOptions): Supervisor {
     };
   }
 
-  async function readSources(): Promise<RawSource> {
-    try {
-      return await readCodeBuddySource();
-    } catch (caught) {
-      return {
-        id: "codebuddy",
-        configPath: "",
-        servers: {},
-        error: messageOf(caught),
-      };
-    }
+  // 每个来源自己吞掉读盘错误，这里不再兜底。
+  function readSources(): Promise<RawSource[]> {
+    return readAllSources();
   }
 
-  /** DSH 自己的记录 + profile 外部挂载；CodeBuddy 侧全部只读。 */
-  function groupsOf(codebuddy: RawSource): SourceGroup[] {
+  /** DSH 自己的记录 + profile 外部挂载；其它来源各自成组，文件不存在的不渲染。 */
+  function groupsOf(sources: RawSource[]): SourceGroup[] {
     const dsh: SourceGroup = {
       id: "dsh",
       configPath: storePath(),
@@ -352,16 +364,16 @@ export function createSupervisor(options: SupervisorOptions): Supervisor {
       servers: [...views(), ...externalViews()],
       ...(storeError === undefined ? {} : { error: storeError }),
     };
-    const external: SourceGroup = {
-      id: "codebuddy",
-      configPath: codebuddy.configPath,
-      writable: false,
-      servers: Object.values(codebuddy.servers).map((server) =>
-        discoveredView("codebuddy", toDiscovered(server)),
-      ),
-      ...(codebuddy.error === undefined ? {} : { error: codebuddy.error }),
-    };
-    return [dsh, external];
+    const readonly = sources
+      .filter((source) => source.existing || source.error !== undefined)
+      .map((source): SourceGroup => ({
+        id: source.id,
+        configPath: source.configPath,
+        writable: false,
+        servers: Object.values(source.servers).map((server) => discoveredView(source.id, toDiscovered(server))),
+        ...(source.error === undefined ? {} : { error: source.error }),
+      }));
+    return [dsh, ...readonly];
   }
 
   function assertWritable(): void {
@@ -386,6 +398,22 @@ export function createSupervisor(options: SupervisorOptions): Supervisor {
     }
   }
 
+  /** 把只读来源里的一条配置转成落盘记录；用的是服务端读到的原文密钥，不走掩码合并。 */
+  function recordFromDiscovered(name: string, entry: RawServer): ServerRecord {
+    const input = parseInput({
+      serverName: name,
+      transport: entry.transport === "stdio" ? "stdio" : "streamable-http",
+      enabled: true,
+      ...(entry.command === undefined ? {} : { command: entry.command }),
+      ...(entry.args === undefined ? {} : { args: entry.args }),
+      ...(entry.env === undefined ? {} : { env: entry.env }),
+      ...(entry.cwd === undefined ? {} : { cwd: entry.cwd }),
+      ...(entry.url === undefined ? {} : { url: entry.url }),
+      ...(entry.headers === undefined ? {} : { headers: entry.headers }),
+    });
+    return applyInput(input);
+  }
+
   async function bootstrap(): Promise<void> {
     try {
       const store = await readStore();
@@ -408,12 +436,12 @@ export function createSupervisor(options: SupervisorOptions): Supervisor {
     async state() {
       await ready;
       const external = externalViews();
-      const codebuddy = await readSources();
+      const sources = await readSources();
       return {
         storePath: storePath(),
         servers: views(),
         external,
-        groups: groupsOf(codebuddy),
+        groups: groupsOf(sources),
         ...(storeError === undefined ? {} : { storeError }),
       };
     },
@@ -503,7 +531,8 @@ export function createSupervisor(options: SupervisorOptions): Supervisor {
       const body = raw as Record<string, unknown>;
       const source = body.source;
       const name = typeof body.name === "string" ? body.name.trim() : "";
-      if (source !== "codebuddy") {
+      const definition = typeof source === "string" ? sourceDefinitions().find((item) => item.id === source) : undefined;
+      if (definition === undefined) {
         throw coded(400, "error.import.source", `不支持的来源：${String(source)}`);
       }
       if (name === "") throw coded(400, "error.import.name", "请指定要导入的服务器名称");
@@ -516,7 +545,7 @@ export function createSupervisor(options: SupervisorOptions): Supervisor {
         );
       }
 
-      const snapshot = await readCodeBuddySource();
+      const snapshot = await readSource(definition);
       if (snapshot.error !== undefined) throw coded(409, "error.import.unreadable", snapshot.error);
       const entry = snapshot.servers[name];
       if (entry === undefined) {
@@ -531,23 +560,63 @@ export function createSupervisor(options: SupervisorOptions): Supervisor {
       }
 
       assertNameAvailable(name);
-      // 这里是服务端直接读到的真实值（前端只拿到过 ***），不需要掩码合并。
-      const input = parseInput({
-        serverName: name,
-        transport: entry.transport,
-        enabled: true,
-        ...(entry.command === undefined ? {} : { command: entry.command }),
-        ...(entry.args === undefined ? {} : { args: entry.args }),
-        ...(entry.env === undefined ? {} : { env: entry.env }),
-        ...(entry.cwd === undefined ? {} : { cwd: entry.cwd }),
-        ...(entry.url === undefined ? {} : { url: entry.url }),
-        ...(entry.headers === undefined ? {} : { headers: entry.headers }),
-      });
-      const record = applyInput(input);
+      const record = recordFromDiscovered(name, entry);
       records = [...records, record];
       await persist();
       if (record.enabled) await mount(record);
       return viewOf(record);
+    },
+
+    async importJson(raw) {
+      await ready;
+      assertWritable();
+      if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+        throw coded(400, "error.import.body", "请求体必须是对象");
+      }
+      const body = raw as Record<string, unknown>;
+      const text = typeof body.json === "string" ? body.json : "";
+      if (text.trim() === "") throw coded(400, "error.import.json.empty", "请粘贴包含 mcpServers 的 JSON");
+      const parsed = parseMcpConfig(text);
+      if (parsed.error !== undefined) throw coded(400, "error.import.json.invalid", parsed.error);
+
+      // 一条坏条目只跳过它自己，整批仍然落地；重名与工具前缀冲突同理。
+      const imported: string[] = [];
+      const skipped: Array<{ name: string; reason: string }> = [];
+      const created: ServerRecord[] = [];
+      const taken = new Set(records.map((record) => record.serverName.toLowerCase()));
+      for (const [name, entry] of Object.entries(parsed.servers)) {
+        if (entry.transport === "unsupported") {
+          skipped.push({ name, reason: `不支持的传输：${entry.rawType ?? "未知"}` });
+          continue;
+        }
+        if (!SERVER_NAME_PATTERN.test(name)) {
+          skipped.push({ name, reason: "名称只能包含字母、数字、- 和 _，最长 32 个字符" });
+          continue;
+        }
+        if (taken.has(name.toLowerCase())) {
+          skipped.push({ name, reason: "已有同名服务器" });
+          continue;
+        }
+        const prefix = `${TOOL_PREFIX}${name}__`;
+        if (toolSchemas().some((schema) => schema.name.startsWith(prefix))) {
+          skipped.push({ name, reason: `工具名前缀 ${prefix} 已被占用` });
+          continue;
+        }
+        try {
+          created.push(recordFromDiscovered(name, entry));
+        } catch (caught) {
+          skipped.push({ name, reason: messageOf(caught) });
+          continue;
+        }
+        taken.add(name.toLowerCase());
+        imported.push(name);
+      }
+      if (created.length > 0) {
+        records = [...records, ...created];
+        await persist();
+        for (const record of created) if (record.enabled) await mount(record);
+      }
+      return { imported, skipped };
     },
 
     async dispose() {

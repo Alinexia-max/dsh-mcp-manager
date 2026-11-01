@@ -8,11 +8,13 @@ import { messageOf } from "./store.js";
 /**
  * 只读来源发现层。
  *
- * 第一版只接 CodeBuddy：用户级 MCP 配置在 `~/.codebuddy/mcp.json`，形态与
- * Claude Code 一致（顶层 `mcpServers` 对象）。本模块**只读不写**：
+ * 聚合各家 MCP 客户端自己的配置文件（CodeBuddy / Claude Desktop / Cursor / VS Code），
+ * 形态基本都是顶层 `mcpServers`（VS Code 用 `servers`）。本模块**只读不写**：
  * - 回传前端的条目一律掩码 `env` / `headers` 的值；
  * - 导入时由服务端重新读一次原文取真实值，密钥不经过前端。
  */
+
+export type ReadonlySourceId = Exclude<SourceId, "dsh">;
 
 /** 服务端内部使用的原始条目（未掩码），只在导入路径上出现。 */
 export interface RawServer {
@@ -31,20 +33,61 @@ export interface RawServer {
 }
 
 export interface RawSource {
-  id: SourceId;
+  id: ReadonlySourceId;
   configPath: string;
   servers: Record<string, RawServer>;
+  /** 配置文件是否存在；不存在的来源不渲染空分组。 */
+  existing: boolean;
   error?: string;
+}
+
+/** 一个只读来源：算好的路径 + 顶层容器键（按顺序取第一个命中的）。 */
+export interface SourceDefinition {
+  id: ReadonlySourceId;
+  path: string;
+  containerKeys: string[];
 }
 
 const SECRET_MASK = "***";
 const PLACEHOLDER = /\$\{[A-Za-z_][A-Za-z0-9_]*\}/;
 
+function envPath(name: string): string | undefined {
+  const value = process.env[name];
+  return typeof value === "string" && value.trim() !== "" ? value : undefined;
+}
+
+/** Windows 用 %APPDATA%，macOS 用 Application Support，其余按 XDG 约定。 */
+function configHome(): string {
+  if (process.platform === "win32") return envPath("APPDATA") ?? join(homedir(), "AppData", "Roaming");
+  if (process.platform === "darwin") return join(homedir(), "Library", "Application Support");
+  return join(homedir(), ".config");
+}
+
 export function codebuddyMcpPath(): string {
   // 环境变量用于测试与非常规安装位置；正常部署走 ~/.codebuddy/mcp.json。
-  const override = process.env.DSMM_CODEBUDDY_MCP;
-  if (typeof override === "string" && override.trim() !== "") return override;
-  return join(homedir(), ".codebuddy", "mcp.json");
+  return envPath("DSMM_CODEBUDDY_MCP") ?? join(homedir(), ".codebuddy", "mcp.json");
+}
+
+/** 每次调用都重新算路径，测试改环境变量后立即生效。 */
+export function sourceDefinitions(): SourceDefinition[] {
+  return [
+    { id: "codebuddy", path: codebuddyMcpPath(), containerKeys: ["mcpServers"] },
+    {
+      id: "claude",
+      path: envPath("DSMM_CLAUDE_MCP") ?? join(configHome(), "Claude", "claude_desktop_config.json"),
+      containerKeys: ["mcpServers"],
+    },
+    {
+      id: "cursor",
+      path: envPath("DSMM_CURSOR_MCP") ?? join(homedir(), ".cursor", "mcp.json"),
+      containerKeys: ["mcpServers"],
+    },
+    {
+      id: "vscode",
+      path: envPath("DSMM_VSCODE_MCP") ?? join(configHome(), "Code", "User", "mcp.json"),
+      containerKeys: ["servers", "mcpServers"],
+    },
+  ];
 }
 
 function plainStrings(value: unknown): Record<string, string> | undefined {
@@ -139,42 +182,80 @@ export function toDiscovered(server: RawServer): DiscoveredServer {
   };
 }
 
+/** 从顶层对象里按容器键取条目；键不存在视为「这份配置没有服务器」。 */
+function extractServers(parsed: unknown, containerKeys: string[]): { servers: Record<string, RawServer>; error?: string } {
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return { servers: {}, error: "顶层必须是对象" };
+  }
+  const root = parsed as Record<string, unknown>;
+  for (const key of containerKeys) {
+    const container = root[key];
+    if (container === undefined) continue;
+    if (container === null || typeof container !== "object" || Array.isArray(container)) {
+      return { servers: {}, error: `${key} 必须是对象` };
+    }
+    const servers: Record<string, RawServer> = {};
+    for (const [name, value] of Object.entries(container as Record<string, unknown>)) {
+      const normalized = normalize(name, value);
+      if (normalized !== undefined) servers[name] = normalized;
+    }
+    return { servers };
+  }
+  return { servers: {} };
+}
+
 /**
- * 读取 CodeBuddy 的用户级 MCP 配置。
+ * 读取一个来源的配置。
  *
- * 文件不存在视为「没有服务器」；文件损坏只记 `error`，不抛错——面板要能带着
- * 错误继续展示其它来源，而不是整块挂掉。
+ * 文件不存在视为「没有服务器」（`existing: false`，面板不渲染该分组）；文件损坏只记
+ * `error`，不抛错——面板要能带着错误继续展示其它来源，而不是整块挂掉。
  */
-export async function readCodeBuddySource(file: string = codebuddyMcpPath()): Promise<RawSource> {
-  const empty: RawSource = { id: "codebuddy", configPath: file, servers: {} };
+export async function readSource(definition: SourceDefinition): Promise<RawSource> {
+  const file = definition.path;
+  const empty: RawSource = { id: definition.id, configPath: file, servers: {}, existing: false };
   let raw: string;
   try {
     raw = await readFile(file, "utf8");
   } catch (caught) {
     if ((caught as NodeJS.ErrnoException).code === "ENOENT") return empty;
-    return { ...empty, error: `无法读取 ${file}：${messageOf(caught)}` };
+    return { ...empty, existing: true, error: `无法读取 ${file}：${messageOf(caught)}` };
   }
 
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
   } catch {
-    return { ...empty, error: `${file} 不是合法 JSON` };
+    return { ...empty, existing: true, error: `${file} 不是合法 JSON` };
   }
-  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
-    return { ...empty, error: `${file} 顶层必须是对象` };
+  const extracted = extractServers(parsed, definition.containerKeys);
+  if (extracted.error !== undefined) {
+    return { ...empty, existing: true, error: `${file} 的 ${extracted.error}` };
   }
+  return { id: definition.id, configPath: file, servers: extracted.servers, existing: true };
+}
 
-  const container = (parsed as Record<string, unknown>).mcpServers;
-  if (container === undefined) return empty;
-  if (container === null || typeof container !== "object" || Array.isArray(container)) {
-    return { ...empty, error: `${file} 的 mcpServers 必须是对象` };
-  }
+/** 一次读完所有来源；单份损坏不影响其它来源。 */
+export async function readAllSources(): Promise<RawSource[]> {
+  return Promise.all(sourceDefinitions().map((definition) => readSource(definition)));
+}
 
-  const servers: Record<string, RawServer> = {};
-  for (const [name, value] of Object.entries(container as Record<string, unknown>)) {
-    const normalized = normalize(name, value);
-    if (normalized !== undefined) servers[name] = normalized;
+/** 兼容旧调用方：只读 CodeBuddy 一份。 */
+export async function readCodeBuddySource(file: string = codebuddyMcpPath()): Promise<RawSource> {
+  return readSource({ id: "codebuddy", path: file, containerKeys: ["mcpServers"] });
+}
+
+/**
+ * 解析用户粘贴的配置片段。
+ *
+ * 与读盘路径共用同一套归一化逻辑，所以 `mcpServers` / `servers` 两种形态都能吃下。
+ * 返回 `error` 而不是抛错，路由层据此给出 400 文案。
+ */
+export function parseMcpConfig(text: string): { servers: Record<string, RawServer>; error?: string } {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch (caught) {
+    return { servers: {}, error: `不是合法 JSON：${messageOf(caught)}` };
   }
-  return { id: "codebuddy", configPath: file, servers };
+  return extractServers(parsed, ["mcpServers", "servers"]);
 }

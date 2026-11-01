@@ -4,10 +4,19 @@ import type * as React from "react";
 export type Translate = (key: string, params?: Record<string, unknown>) => string;
 
 export type Transport = "stdio" | "streamable-http";
-export type Phase = "disabled" | "connecting" | "ready" | "error" | "external";
+/** `exhausted`：曾经连上过、之后断开且工具已消失，通常是上游重连预算用尽。 */
+export type Phase = "disabled" | "connecting" | "ready" | "error" | "exhausted" | "external";
 
 /** 配置来源：DSH 自己的 servers.json，以及只读聚合进来的外部客户端。 */
-export type SourceId = "dsh" | "codebuddy";
+export type SourceId = "dsh" | "codebuddy" | "claude" | "cursor" | "vscode";
+
+/** 与 src/store.ts 的 ReconnectPolicy 保持一致；客户端不 import 服务端模块。 */
+export interface ReconnectPolicy {
+  enabled?: boolean;
+  initialDelayMs?: number;
+  maxDelayMs?: number;
+  maxAttempts?: number;
+}
 
 /** `unsupported` 表示对方配置里的传输方式本插件接不了（例如 sse）。 */
 export type DiscoveredTransport = Transport | "unsupported";
@@ -44,10 +53,12 @@ export interface ServerView {
   url?: string;
   headers?: Record<string, string>;
   toolCallTimeoutMs?: number;
+  reconnect?: ReconnectPolicy;
+  maxInstructionBytes?: number;
   createdAt: string;
   updatedAt: string;
   external: boolean;
-  /** 该条目来自哪个来源；`codebuddy` 的条目只读，只能导入。 */
+  /** 该条目来自哪个来源；非 `dsh` 的条目只读，只能导入。 */
   origin: SourceId;
   importable?: boolean;
   placeholders?: string[];
@@ -78,6 +89,12 @@ export interface ManagerState {
   /** 按来源分组后的视图，面板以此渲染；上面三个字段保留给老调用方。 */
   groups: SourceGroup[];
   storeError?: string;
+}
+
+/** `POST /import-json` 的应答：成功与被跳过的条目分开报告。 */
+export interface ImportJsonResult {
+  imported: string[];
+  skipped: Array<{ name: string; reason: string }>;
 }
 
 /** settings.section 组件收到的 owner props；`t` 由 apply 里的 slot inject 提供。 */

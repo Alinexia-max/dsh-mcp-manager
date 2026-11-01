@@ -125,5 +125,51 @@ eq(config.transport, "stdio", "mcp config keeps the transport");
 eq(config.failOnStartupError, true, "startup failures must be visible in the panel");
 eq(config.args.length, 2, "mcp config carries args");
 
+// 上游支持但第一版没透传的三个字段：重连策略与服务器指令上限。
+const tunedInput = store.parseInput({
+  serverName: "tuned",
+  transport: "stdio",
+  command: "node",
+  reconnect: { enabled: false, initialDelayMs: 1000, maxDelayMs: 5000, maxAttempts: 3 },
+  maxInstructionBytes: 4096,
+});
+const tunedConfig = store.toMcpConfig(store.applyInput(tunedInput));
+eq(
+  tunedConfig.reconnect,
+  { enabled: false, initialDelayMs: 1000, maxDelayMs: 5000, maxAttempts: 3 },
+  "reconnect policy reaches dsh-mcp-client",
+);
+eq(tunedConfig.maxInstructionBytes, 4096, "instruction limit reaches dsh-mcp-client");
+
+await rejects(
+  () =>
+    Promise.resolve().then(() =>
+      store.parseInput({ serverName: "demo", transport: "stdio", command: "x", reconnect: { initialDelayMs: 10 } }),
+    ),
+  "error.input.reconnect.initialDelayMs",
+  "out-of-range reconnect delay is rejected",
+);
+await rejects(
+  () =>
+    Promise.resolve().then(() =>
+      store.parseInput({
+        serverName: "demo",
+        transport: "stdio",
+        command: "x",
+        reconnect: { initialDelayMs: 5000, maxDelayMs: 1000 },
+      }),
+    ),
+  "error.input.reconnect",
+  "max delay below the initial delay is rejected",
+);
+await rejects(
+  () =>
+    Promise.resolve().then(() =>
+      store.parseInput({ serverName: "demo", transport: "stdio", command: "x", maxInstructionBytes: 10 }),
+    ),
+  "error.input.maxInstructionBytes",
+  "out-of-range instruction limit is rejected",
+);
+
 console.log(`\nstore: ${passed} passed, ${failed} failed`);
 if (failed > 0) process.exit(1);

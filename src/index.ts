@@ -416,6 +416,10 @@ function apply(ctx: HostContext, config?: PluginConfig): void {
             if (segments.length === 1 && segments[0] === "import") {
               return run(res, () => supervisor.importServer(body));
             }
+            // 粘贴一整段 mcpServers 片段批量建服务器。
+            if (segments.length === 1 && segments[0] === "import-json") {
+              return run(res, () => supervisor.importJson(body));
+            }
 
             if (segments[0] !== "servers") {
               notFound(res, path);

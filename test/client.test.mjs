@@ -107,6 +107,27 @@ const httpPayload = bundle.payloadFrom(
 eq(httpPayload.url, "https://example.com/mcp", "http payload carries the url");
 ok(!("command" in httpPayload), "http payload has no command");
 
+const tunedPayload = bundle.payloadFrom(
+  Object.assign({}, validDraft, {
+    reconnectInitialDelayMs: "1000",
+    reconnectMaxAttempts: "3",
+    maxInstructionBytes: "4096",
+  }),
+);
+eq(
+  tunedPayload.reconnect,
+  { enabled: true, initialDelayMs: 1000, maxAttempts: 3 },
+  "reconnect policy reaches the payload",
+);
+eq(tunedPayload.maxInstructionBytes, 4096, "instruction limit reaches the payload");
+
+const badDelay = Object.assign({}, validDraft, { reconnectInitialDelayMs: "10" });
+eq(
+  bundle.validate(badDelay, (key) => bundle.DICT.zh[key]),
+  bundle.DICT.zh["error.reconnect"],
+  "out-of-range reconnect delay is rejected client-side",
+);
+
 /** 在指定页面基址下解析一次，用完恢复，避免污染其它断言。 */
 function withBase(baseURI, run) {
   const previous = Object.prototype.hasOwnProperty.call(globalThis, "document") ? globalThis.document : undefined;

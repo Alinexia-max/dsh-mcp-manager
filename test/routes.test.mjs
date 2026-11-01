@@ -27,6 +27,12 @@ process.env.DSH_HOME = home;
 // CodeBuddy 侧用环境变量指向临时文件，避免测试依赖开发者本机的 ~/.codebuddy。
 const codebuddyFile = join(home, "codebuddy-mcp.json");
 process.env.DSMM_CODEBUDDY_MCP = codebuddyFile;
+
+// 其它来源同样隔离：开发者本机若装了 Claude / Cursor / VS Code，配置不能被聚合进断言。
+const claudeFile = join(home, "claude-config.json");
+process.env.DSMM_CLAUDE_MCP = claudeFile;
+process.env.DSMM_CURSOR_MCP = join(home, "cursor-mcp.json");
+process.env.DSMM_VSCODE_MCP = join(home, "vscode-mcp.json");
 await writeFile(
   codebuddyFile,
   JSON.stringify(
@@ -372,9 +378,66 @@ eq(unsupportedImport.status, 400, "unsupported transports cannot be imported");
 
 const unknownImport = await call("POST", "/api/dsh-mcp-manager/import", {
   headers: MUTATION_HEADERS,
-  body: { source: "cursor", name: "context7" },
+  body: { source: "unknown", name: "context7" },
 });
 eq(unknownImport.status, 400, "unknown sources are rejected");
+
+// 额外来源：文件不存在时不出分组，存在时可发现、可导入。
+const absentClaude = await call("GET", "/api/dsh-mcp-manager");
+eq(
+  (absentClaude.payload?.data?.groups ?? []).some((group) => group.id === "claude"),
+  false,
+  "sources without a config file are not listed",
+);
+
+await writeFile(
+  claudeFile,
+  JSON.stringify({ mcpServers: { claudeDemo: { command: "npx", args: ["-y", "demo"] } } }),
+  "utf8",
+);
+const withClaude = await call("GET", "/api/dsh-mcp-manager");
+const claudeGroup = (withClaude.payload?.data?.groups ?? []).find((group) => group.id === "claude");
+eq(claudeGroup?.writable, false, "the Claude group is read-only");
+eq(claudeGroup?.configPath, claudeFile, "the Claude group exposes its config path");
+eq(claudeGroup?.servers?.[0]?.serverName, "claudeDemo", "Claude entries are discovered");
+
+const claudeImport = await call("POST", "/api/dsh-mcp-manager/import", {
+  headers: MUTATION_HEADERS,
+  body: { source: "claude", name: "claudeDemo" },
+});
+eq(claudeImport.status, 200, "entries from any read-only source can be imported");
+
+// 粘贴导入：一条新条目、一条重名、一条不支持的传输、一条非法名称。
+const pasted = await call("POST", "/api/dsh-mcp-manager/import-json", {
+  headers: MUTATION_HEADERS,
+  body: {
+    json: JSON.stringify({
+      mcpServers: {
+        pastedDemo: { command: "node", args: ["server.js"], env: { TOKEN: "pasted-secret" } },
+        claudeDemo: { command: "node", args: ["dup.js"] },
+        pastedSse: { type: "sse", url: "https://example.com/sse" },
+        "bad.name": { command: "node" },
+      },
+    }),
+  },
+});
+eq(pasted.status, 200, "paste import accepts an mcpServers fragment");
+eq(pasted.payload?.data?.imported, ["pastedDemo"], "paste import creates the valid entries");
+eq(
+  (pasted.payload?.data?.skipped ?? []).map((item) => item.name),
+  ["claudeDemo", "pastedSse", "bad.name"],
+  "paste import reports every skipped entry",
+);
+
+const pastedStore = JSON.parse(await readFile(join(home, "mcp-manager", "servers.json"), "utf8"));
+const pastedRecord = pastedStore.servers.find((item) => item.serverName === "pastedDemo");
+eq(pastedRecord?.env, { TOKEN: "pasted-secret" }, "paste import keeps secrets on the host side");
+
+const badPaste = await call("POST", "/api/dsh-mcp-manager/import-json", {
+  headers: MUTATION_HEADERS,
+  body: { json: "{ not json" },
+});
+eq(badPaste.status, 400, "invalid paste JSON is rejected");
 
 for (const dispose of disposers) await dispose();
 
